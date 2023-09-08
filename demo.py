@@ -63,7 +63,11 @@ def infer_fast(net, img, net_input_height_size, stride, upsample_ratio, cpu,
 
     tensor_img = torch.from_numpy(padded_img).permute(2, 0, 1).unsqueeze(0).float()
     if not cpu:
-        tensor_img = tensor_img.cuda()
+        if torch.cuda.is_available():
+            tensor_img = tensor_img.cuda()
+        elif torch.backends.mps.is_available():
+            tensor_img = tensor_img.to('mps')
+        # tensor_img = tensor_img.cuda()
 
     stages_output = net(tensor_img)
 
@@ -81,7 +85,10 @@ def infer_fast(net, img, net_input_height_size, stride, upsample_ratio, cpu,
 def run_demo(net, image_provider, height_size, cpu, track, smooth):
     net = net.eval()
     if not cpu:
-        net = net.cuda()
+        if torch.cuda.is_available():
+            net = net.cuda()
+        elif torch.backends.mps.is_available():
+            net = net.to('mps')
 
     stride = 8
     upsample_ratio = 4
