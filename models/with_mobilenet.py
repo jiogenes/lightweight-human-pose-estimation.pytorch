@@ -120,4 +120,60 @@ class PoseEstimationWithMobileNet(nn.Module):
             stages_output.extend(
                 refinement_stage(torch.cat([backbone_features, stages_output[-2], stages_output[-1]], dim=1)))
 
-        return stages_output
+        return [backbone_features, stages_output]
+        # return stages_output
+
+class PoseClassificationWithMobileNet(nn.Module):
+    def __init__(self, pretrained, num_heatmaps=19, num_pafs=38, height=128):
+        super().__init__()
+        self.pretrained = pretrained
+        for param in self.pretrained.parameters():
+            param.requires_grad = False
+
+        # self.classifier = nn.Linear((height + num_heatmaps + num_pafs) * 16**2, 1)
+        # self.classifier = nn.Sequential(
+        #     nn.Linear((height + num_heatmaps) * 16**2, 16),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.2),
+
+        #     nn.Linear(16, 1),
+        # )
+        self.classifier = nn.Sequential(
+            nn.Conv2d((num_heatmaps), 32, 5, 1, 2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+
+            nn.Conv2d(32, 32, 5, 2, 2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+
+            nn.Conv2d(32, 32, 5, 1, 2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+
+            nn.Conv2d(32, 32, 5, 2, 2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        batch_size = x.size(0)
+
+        with torch.no_grad():
+            result = self.pretrained(x)
+        
+        # result = torch.cat([result[0].view(batch_size, -1), result[1][-1].view(batch_size, -1), result[1][-2].view(batch_size, -1)], dim=1)
+        
+        # print(result[0].max(), result[1][-2].max())
+
+        # result = torch.cat([result[0], result[1][-2]], dim=1)
+        # result = torch.cat([result[0], result[1][-2]], dim=1)
+
+        result = self.classifier(result[1][-2])
+
+        return result

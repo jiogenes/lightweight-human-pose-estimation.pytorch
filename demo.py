@@ -23,7 +23,7 @@ class ImageReader(object):
     def __next__(self):
         if self.idx == self.max_idx:
             raise StopIteration
-        img = cv2.imread(self.file_names[self.idx], cv2.IMREAD_COLOR)
+        img = cv2.imread(str(self.file_names[self.idx]), cv2.IMREAD_COLOR)
         if img.size == 0:
             raise IOError('Image {} cannot be read'.format(self.file_names[self.idx]))
         self.idx = self.idx + 1
