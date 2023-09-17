@@ -120,8 +120,7 @@ class PoseEstimationWithMobileNet(nn.Module):
             stages_output.extend(
                 refinement_stage(torch.cat([backbone_features, stages_output[-2], stages_output[-1]], dim=1)))
 
-        return [backbone_features, stages_output]
-        # return stages_output
+        return stages_output
 
 class PoseClassificationWithMobileNet(nn.Module):
     def __init__(self, pretrained, num_heatmaps=19, num_pafs=38, height=128):
@@ -174,6 +173,12 @@ class PoseClassificationWithMobileNet(nn.Module):
         # result = torch.cat([result[0], result[1][-2]], dim=1)
         # result = torch.cat([result[0], result[1][-2]], dim=1)
 
-        result = self.classifier(result[1][-2])
+        # import matplotlib.pylab as plt
+        # print(result[1][-2].max(), result[1][-2].min())
+        # plt.imshow(result[1][-2][0].max(dim=0).values.detach().cpu().numpy())
+        # plt.savefig("test.png")
+        # print(result[1][-2].size())
 
-        return result
+        output = self.classifier(result[-2])
+
+        return output, result
