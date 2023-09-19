@@ -1,13 +1,15 @@
+import os
 import sys
 from pathlib import Path
 from PIL import Image
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (QApplication, QLabel, QMainWindow, QPushButton, 
-                             QComboBox, QFrame, QFileDialog, QFrame, QInputDialog, QMessageBox)
+                             QComboBox, QFrame, QFileDialog, QFrame, QInputDialog, 
+                             QMessageBox, QProgressBar)
 
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -17,6 +19,106 @@ from modules.keypoints import extract_keypoints, group_keypoints
 from modules.pose import Pose
 from modules.load_state import load_state
 from val import normalize, pad_width
+
+class TrainThread(QThread):
+    progress = pyqtSignal(int)
+
+    def set_arguments(self, net, new_motion_name, transform):
+        self.net = net
+        self.new_motion_name = new_motion_name
+        self.transform = transform
+
+        self.epochs = 5
+        self.cpu_count = os.cpu_count()
+
+    def run(self):
+        dataset = CustomDataset(self.new_motion_name, self.transform)
+
+        if torch.cuda.is_available():
+            self.net = self.net.cuda()
+        elif torch.backends.mps.is_available():
+            self.net = self.net.to('mps')
+
+        trainlen = int(len(dataset) * 0.8)
+        testlen = len(dataset) - trainlen
+        train_dataset, test_dataset = random_split(dataset, [trainlen, testlen])
+
+        train_dataloader = DataLoader(train_dataset, batch_size=self.cpu_count, shuffle=True, num_workers=self.cpu_count)
+        test_dataloader = DataLoader(test_dataset, batch_size=self.cpu_count, shuffle=False, num_workers=self.cpu_count)
+
+        optimizer = torch.optim.AdamW(self.net.classifier.parameters(), lr=0.001, betas=(0.5, 0.999))
+        loss_func = torch.nn.BCEWithLogitsLoss()
+        
+        for e in range(self.epochs):
+            self.progress.emit(int((e + 1) * 100 / self.epochs))
+            QThread.msleep(100)  
+
+            self.net.train()
+            loss_avg, acc = 0, 0
+            print(f'epoch : {e+1}')
+            for idx, batch in enumerate(train_dataloader):
+                QThread.msleep(100)
+
+                images, labels = batch
+                if torch.cuda.is_available():
+                    images = images.cuda()
+                    labels = labels.float().cuda()
+                elif torch.backends.mps.is_available():
+                    images = images.to('mps')
+                    labels = labels.float().to('mps')
+                else:
+                    labels = labels.float()
+
+                pred, _ = self.net(images)
+                optimizer.zero_grad()
+                loss = loss_func(pred.squeeze(), labels)
+                loss.backward()
+                optimizer.step()
+
+                loss_avg += loss.cpu().detach().item()
+                acc += ((torch.nn.functional.sigmoid(pred.squeeze()) > 0.5) == labels.squeeze()).float().mean().item()
+
+            print('train loss :', loss_avg / (idx+1))
+            print('train acc :', acc*100 / (idx+1) )
+
+            self.net.eval()
+            loss_avg, acc = 0, 0
+            for idx, batch in enumerate(test_dataloader):
+                QThread.msleep(100)
+
+                images, labels = batch
+                if torch.cuda.is_available():
+                    images = images.cuda()
+                    labels = labels.float().cuda()
+                elif torch.backends.mps.is_available():
+                    images = images.to('mps')
+                    labels = labels.float().to('mps')
+                else:
+                    labels = labels.float()
+
+
+                pred, _ = self.net(images)
+                loss = loss_func(pred.squeeze(), labels)
+
+                loss_avg += loss.cpu().detach().item()
+                acc += ((torch.nn.functional.sigmoid(pred.squeeze()) > 0.5) == labels.squeeze()).float().mean().item()
+
+            print('test loss :', loss_avg / (idx+1))
+            print('test acc :', acc*100 / (idx+1))
+
+        self.save_motion()
+        
+
+    def save_motion(self):
+        state_dict = self.net.state_dict()
+        for key in list(state_dict.keys()):
+            if 'pretrained' in key:
+                state_dict.pop(key)
+
+        with open(f'./motions/{self.new_motion_name}.pt', 'wb') as f:
+            torch.save({'state_dict': state_dict}, f)
+        
+        print('success to save to "./motions/{self.new_motion_name}.pt"')
 
 class App(QMainWindow):
 
@@ -29,6 +131,16 @@ class App(QMainWindow):
         self.num_keypoints = Pose.num_kpts
         self.previous_poses = []
 
+        self.transform = transforms.Compose([
+            transforms.Resize(size=(128, 128), antialias=True),
+            transforms.RandomApply([
+                transforms.RandomRotation(10),
+            ], p=0.3),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        ])
+
         pretrained = PoseEstimationWithMobileNet()
         checkpoint = torch.load('./weights/checkpoint_iter_370000.pth', map_location='cpu')
         load_state(pretrained, checkpoint)
@@ -38,30 +150,31 @@ class App(QMainWindow):
         self.setWindowTitle("Motion Detection Application")
         self.setGeometry(100, 100, 700, 700)
 
+        self.train_thread = TrainThread()
+        self.train_thread.progress.connect(self.update_long_task_progress)
+        self.train_thread.finished.connect(self.thread_finished)
+
         self.capture = None
         self.timer = QTimer(self)
-        self.wait_timer = QTimer(self)
-
-        # ComboBox for Mode Selector
-        # self.modeSelector = QComboBox(self)
-        # self.modeSelector.addItem('Mode 1')
-        # self.modeSelector.addItem('Mode 2')
-        # self.modeSelector.currentIndexChanged.connect(self.select_mode)
-        # self.modeSelector.move(20, 20)
 
         # Start Video Feed Button
-        self.startButton = QPushButton("Detection", self)
-        self.startButton.clicked.connect(self.start_video)
-        self.startButton.move(20, 60)
+        self.start_button = QPushButton("Detection", self)
+        self.start_button.clicked.connect(self.start_video)
+        self.start_button.move(20, 60)
 
-        self.stopButton = QPushButton('Stop', self)
-        self.stopButton.clicked.connect(self.stop_video)
-        self.stopButton.move(120, 60)
+        self.stop_button = QPushButton('Stop', self)
+        self.stop_button.clicked.connect(self.stop_video)
+        self.stop_button.move(120, 60)
 
         # Status Label
-        self.statusLabel = QLabel("Status: Select the motions you want to detect or set your own motions ", self)
-        # self.statusLabel.move(20, 100)
-        self.statusLabel.setGeometry(20, 20, 600, 20)
+        self.status_label = QLabel("Status: Select the motions you want to detect or set your own motions ", self)
+        self.status_label.setGeometry(20, 20, 600, 20)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setGeometry(20, 40, 100, 20)
+        self.progress_bar.setMaximum(0)
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setVisible(False)
 
         # Status Color Pane
         # self.colorPane = QFrame(self)
@@ -69,32 +182,44 @@ class App(QMainWindow):
         # self.colorPane.setGeometry(150, 100, 50, 20)
 
         # Video Label
-        self.videoLabel = QLabel(self)
-        self.videoLabel.setGeometry(50, 200, 640, 480)
+        self.video_label = QLabel(self)
+        self.video_label.setGeometry(50, 200, 640, 480)
 
         # Division Line
-        self.divisionLine = QFrame(self)
-        self.divisionLine.setFrameShape(QFrame.Shape.HLine)
-        self.divisionLine.setFrameShadow(QFrame.Shadow.Sunken)
-        self.divisionLine.setGeometry(0, 180, 800, 1)
+        self.division_line = QFrame(self)
+        self.division_line.setFrameShape(QFrame.Shape.HLine)
+        self.division_line.setFrameShadow(QFrame.Shadow.Sunken)
+        self.division_line.setGeometry(0, 180, 800, 1)
 
         # Save and Load Buttons
-        self.saveButton = QPushButton("New Motion", self)
-        self.saveButton.clicked.connect(self.make_new_motion)
-        self.saveButton.move(20, 130)
+        self.save_button = QPushButton("New Motion", self)
+        self.save_button.clicked.connect(self.make_new_motion)
+        self.save_button.move(20, 130)
 
-        self.loadButton = QPushButton("Select Motion", self)
-        self.loadButton.clicked.connect(self.load_motion)
-        self.loadButton.move(120, 130)
+        self.load_button = QPushButton("Select Motion", self)
+        self.load_button.clicked.connect(self.load_motion)
+        self.load_button.move(120, 130)
 
         self.show()
 
     def show_info(self, text):
-        msg = QMessageBox()
+        msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Icon.Warning)
         msg.setText(text)
         msg.setWindowTitle("Info")
-        msg.exec()
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        value = msg.exec()
+        return value
+    
+    def update_long_task_progress(self, value):
+        self.status_label.setText(f'Progress: {value}%')
+        # self.progressBar.setValue(value)
+
+    def thread_finished(self):
+        self.status_label.setText(f'Status: Done!')
+        self.progress_bar.setVisible(False)
+        self.stop_video()
+        self.is_new_motion = False
 
     def select_mode(self):
         current_mode = self.modeSelector.currentText()
@@ -107,15 +232,15 @@ class App(QMainWindow):
             self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.timer.timeout.connect(self.update_frame)
             self.timer.start(30)
-            self.statusLabel.setText("Status: Running")
+            self.status_label.setText("Status: Running")
 
     def stop_video(self):
         if self.capture:
             self.timer.stop()
             self.capture.release()
             self.capture = None
-            self.videoLabel.clear()
-            self.statusLabel.setText('Status: Stop')
+            self.video_label.clear()
+            self.status_label.setText('Status: Stop')
 
     def update_frame(self):
         ret, img = self.capture.read()
@@ -152,10 +277,10 @@ class App(QMainWindow):
             for pose in current_poses:
                 if output:
                     color = (255, 0, 0)
-                    self.statusLabel.setText("Status: Detected!")
+                    self.status_label.setText("Status: Detected!")
                 else:
                     color = (0, 255, 0)
-                    self.statusLabel.setText("Status: Not Detected")
+                    self.status_label.setText("Status: Not Detected")
 
                 cv2.rectangle(img, (pose.bbox[0], pose.bbox[1]),
                             (pose.bbox[0] + pose.bbox[2], pose.bbox[1] + pose.bbox[3]), color)
@@ -163,27 +288,29 @@ class App(QMainWindow):
             self.display_image(img)
 
         else:
-            self. capture_image(img)
+            self.capture_image(img)
 
     def display_image(self, img):
         qformat = QImage.Format.Format_RGB888
         img = QImage(img, img.shape[1], img.shape[0], qformat)
-        self.videoLabel.setPixmap(QPixmap.fromImage(img))
+        self.video_label.setPixmap(QPixmap.fromImage(img))
 
     def capture_image(self, img):
         qformat = QImage.Format.Format_RGB888
         frame = QImage(img, img.shape[1], img.shape[0], qformat)
-        self.videoLabel.setPixmap(QPixmap.fromImage(frame))
+        self.video_label.setPixmap(QPixmap.fromImage(frame))
 
         Path(f'./data/{self.new_motion_name}/').mkdir(parents=True, exist_ok=True)
 
         image_count = len(list(Path(f'./data/{self.new_motion_name}/').glob('*.jpg')))
         if image_count <= 200:
             cv2.imwrite(f'./data/{self.new_motion_name}/frame_{image_count}.jpg', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            self.status_label.setText(f'Status: Take {image_count} pictures')
         else:
             self.stop_video()
             self.is_new_motion = False
-
+            self.train_thread.set_arguments(self.net, self.new_motion_name, self.transform)
+            self.train_thread.start()
 
     def load_motion(self):
         options = QFileDialog.Option(QFileDialog.Option.HideNameFilterDetails)
@@ -198,6 +325,7 @@ class App(QMainWindow):
                 self.net = self.net.to('mps')
 
     def make_new_motion(self):
+        self.status_label.setText("Status: Make New Motion")
         text, ok = QInputDialog.getText(self, 'Motion Name', 'Enter Motion Name:')
 
         if not ok or not text:
@@ -205,113 +333,20 @@ class App(QMainWindow):
         
         self.is_new_motion = True
         self.new_motion_name = text
+
+        value = self.show_info('Take a picture of your posture. Please take your stance. If you want to cancel this process, you can press the cancel button.')
+        if value != QMessageBox.StandardButton.Ok:
+            self.status_label.setText("Status: Select the motions you want to detect or set your own motions")
+            return
         
+        self.progress_bar.setVisible(True)
+
         self.make_dataset()
 
-        # self.train(self.net)
-
-        # self.save_motion(text)
-
-        # self.is_new_motion = False
 
     def make_dataset(self):
-
-        self.show_info('Take a picture of your posture. Please take your stance.')
+        self.status_label.setText("Status: Take Pictures")
         self.start_video()
-        # QTimer.singleShot(2000, self.stop_video)
-        # self.stop_video()
-
-
-        transform = transforms.Compose([
-            transforms.Resize(size=(128, 128), antialias=True),
-            transforms.RandomApply([
-                # transforms.RandomResizedCrop((128, 128), scale=(0.9, 1.1), ratio=(0.9, 1.1), antialias=True), 
-                # transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5)
-                transforms.RandomRotation(10),
-            ], p=0.3),
-            # transforms.RandomVerticalFlip(p=0.3),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-        ])
-
-        # dataset = CustomDataset(transform)
-
-
-        # return dataset
-
-    def train(net, dataset):
-        trainlen = int(len(dataset) * 0.8)
-        testlen = len(dataset) - trainlen
-        train_dataset, test_dataset = random_split(dataset, [trainlen, testlen])
-
-        train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=8)
-        test_dataloader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=8)
-
-        optimizer = torch.optim.AdamW(net.classifier.parameters(), lr=0.001, betas=(0.5, 0.999))
-        loss_func = torch.nn.BCEWithLogitsLoss()
-        
-        for e in range(5):
-            net.train()
-            loss_avg, acc = 0, 0
-            print(f'epoch : {e+1}')
-            for idx, batch in enumerate(train_dataloader):
-                images, labels = batch
-                if torch.cuda.is_available():
-                    images = images.cuda()
-                    labels = labels.float().cuda()
-                elif torch.backends.mps.is_available():
-                    images = images.to('mps')
-                    labels = labels.float().to('mps')
-                else:
-                    labels = labels.float()
-
-                pred, _ = net(images)
-                optimizer.zero_grad()
-                loss = loss_func(pred.squeeze(), labels)
-                loss.backward()
-                optimizer.step()
-
-                loss_avg += loss.cpu().detach().item()
-                acc += ((torch.nn.functional.sigmoid(pred.squeeze()) > 0.5) == labels.squeeze()).float().mean().item()
-
-            print('train loss :', loss_avg / (idx+1))
-            print('train acc :', acc*100 / (idx+1) )
-
-            net.eval()
-            loss_avg, acc = 0, 0
-            for idx, batch in enumerate(test_dataloader):
-                images, labels = batch
-                if torch.cuda.is_available():
-                    images = images.cuda()
-                    labels = labels.float().cuda()
-                elif torch.backends.mps.is_available():
-                    images = images.to('mps')
-                    labels = labels.float().to('mps')
-                else:
-                    labels = labels.float()
-
-
-                pred, _ = net(images)
-                loss = loss_func(pred.squeeze(), labels)
-
-                loss_avg += loss.cpu().detach().item()
-                acc += ((torch.nn.functional.sigmoid(pred.squeeze()) > 0.5) == labels.squeeze()).float().mean().item()
-
-            print('test loss :', loss_avg / (idx+1))
-            print('test acc :', acc*100 / (idx+1))
-        
-        return net
-
-    def save_motion(self, motion_name):
-        state_dict = self.net.state_dict()
-        for key in list(state_dict.keys()):
-            if 'pretrained' in key:
-                state_dict.pop(key)
-
-        with open(f'./motions/{motion_name}.pt', 'wb') as f:
-            torch.save({'state_dict': state_dict}, f)
 
     def infer_fast(self, img, net_input_height_size, stride, upsample_ratio,
                pad_value=(0, 0, 0), img_mean=np.array([128, 128, 128], np.float32), img_scale=np.float32(1/256)):
