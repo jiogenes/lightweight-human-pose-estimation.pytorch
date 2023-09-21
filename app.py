@@ -127,7 +127,7 @@ class App(QMainWindow):
         self.is_new_motion = False
         self.height_size = 256
         self.stride = 8
-        self.upsample_ratio = 4
+        self.upsample_ratio = 8
         self.num_keypoints = Pose.num_kpts
         self.previous_poses = []
 
@@ -141,11 +141,11 @@ class App(QMainWindow):
             transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         ])
 
-        pretrained = PoseEstimationWithMobileNet()
+        self.pretrained = PoseEstimationWithMobileNet()
         checkpoint = torch.load('./weights/checkpoint_iter_370000.pth', map_location='cpu')
-        load_state(pretrained, checkpoint)
+        load_state(self.pretrained, checkpoint)
 
-        self.net = PoseClassificationWithMobileNet(pretrained)
+        self.net = PoseClassificationWithMobileNet(self.pretrained)
 
         self.setWindowTitle("Motion Detection Application")
         self.setGeometry(100, 100, 700, 700)
@@ -221,9 +221,9 @@ class App(QMainWindow):
         self.stop_video()
         self.is_new_motion = False
 
-    def select_mode(self):
-        current_mode = self.modeSelector.currentText()
-        print(f"{current_mode} selected")
+    # def select_mode(self):
+    #     current_mode = self.modeSelector.currentText()
+    #     print(f"{current_mode} selected")
 
     def start_video(self):
         if not self.capture:
@@ -275,12 +275,12 @@ class App(QMainWindow):
                 pose.draw(img)
             img = cv2.addWeighted(orig_img, 0.6, img, 0.4, 0)
             for pose in current_poses:
-                if output:
+                if output >= 0.5:
                     color = (255, 0, 0)
-                    self.status_label.setText("Status: Detected!")
+                    self.status_label.setText(f"Status: prob={int(output * 100)}%, Detected!")
                 else:
                     color = (0, 255, 0)
-                    self.status_label.setText("Status: Not Detected")
+                    self.status_label.setText(f"Status: prob={int(output * 100)}%, Not Detected")
 
                 cv2.rectangle(img, (pose.bbox[0], pose.bbox[1]),
                             (pose.bbox[0] + pose.bbox[2], pose.bbox[1] + pose.bbox[3]), color)
@@ -314,7 +314,7 @@ class App(QMainWindow):
 
     def load_motion(self):
         options = QFileDialog.Option(QFileDialog.Option.HideNameFilterDetails)
-        file_name, _ = QFileDialog.getOpenFileName(self, "Load File", "~/", "All Files (*);;Text Files (*.txt)", options=options)
+        file_name, _ = QFileDialog.getOpenFileName(self, "Load File", "./motions/", "Weight Files (*.pt)", options=options)
         if file_name:
             checkpoint = torch.load(file_name, map_location='cpu')
             load_state(self.net, checkpoint)
@@ -366,7 +366,7 @@ class App(QMainWindow):
             tensor_img = tensor_img.to('mps')
 
         output, stages_output = self.net(tensor_img)
-        output = (torch.nn.functional.sigmoid(output.squeeze()) > 0.5).cpu().item()
+        output = torch.nn.functional.sigmoid(output.squeeze()).cpu().item()
 
         stage2_heatmaps = stages_output[-2]
         heatmaps = np.transpose(stage2_heatmaps.squeeze().cpu().data.numpy(), (1, 2, 0))

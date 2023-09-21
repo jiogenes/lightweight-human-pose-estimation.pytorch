@@ -123,12 +123,18 @@ class PoseEstimationWithMobileNet(nn.Module):
         return stages_output
 
 class PoseClassificationWithMobileNet(nn.Module):
-    def __init__(self, pretrained, num_heatmaps=19, num_pafs=38, height=128):
+    def __init__(self, pretrained, num_heatmaps=19, num_pafs=38, height=256):
         super().__init__()
+
+        self.num_heatmaps = num_heatmaps
+        self.num_pafs = num_pafs
+        self.height = height
+
         self.pretrained = pretrained
         for param in self.pretrained.parameters():
             param.requires_grad = False
 
+        ######## first try
         # self.classifier = nn.Linear((height + num_heatmaps + num_pafs) * 16**2, 1)
         # self.classifier = nn.Sequential(
         #     nn.Linear((height + num_heatmaps) * 16**2, 16),
@@ -137,48 +143,63 @@ class PoseClassificationWithMobileNet(nn.Module):
 
         #     nn.Linear(16, 1),
         # )
+
+        ######### secend try
+        # self.hm_feature_extractor = nn.Sequential(
+        #     nn.Conv2d((num_heatmaps), 32, 5, 1, 2),
+        #     nn.BatchNorm2d(32),
+        #     nn.ReLU(),
+
+        #     nn.Conv2d(32, 32, 5, 2, 2),
+        #     nn.BatchNorm2d(32),
+        #     nn.ReLU(),
+
+        #     nn.Conv2d(32, 32, 5, 1, 2),
+        #     nn.BatchNorm2d(32),
+        #     nn.ReLU(),
+
+        #     nn.Conv2d(32, 32, 5, 2, 2),
+        #     nn.BatchNorm2d(32),
+        #     nn.ReLU(),
+
+        #     nn.AdaptiveAvgPool2d((1, 1)),
+        #     nn.Flatten(),
+
+        #     nn.Linear(32, 1)
+        # )
+
+        ######## third try
         self.classifier = nn.Sequential(
-            nn.Conv2d((num_heatmaps), 32, 5, 1, 2),
-            nn.BatchNorm2d(32),
+            nn.Linear(self.num_heatmaps * 2, self.num_heatmaps),
             nn.ReLU(),
+            nn.Dropout(0.1),
 
-            nn.Conv2d(32, 32, 5, 2, 2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-
-            nn.Conv2d(32, 32, 5, 1, 2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-
-            nn.Conv2d(32, 32, 5, 2, 2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-
-            nn.Linear(32, 1)
+            nn.Linear(self.num_heatmaps, 1)
         )
+        
 
     def forward(self, x):
         batch_size = x.size(0)
 
         with torch.no_grad():
-            result = self.pretrained(x)
+            stages_output = self.pretrained(x)
         
-        # result = torch.cat([result[0].view(batch_size, -1), result[1][-1].view(batch_size, -1), result[1][-2].view(batch_size, -1)], dim=1)
-        
-        # print(result[0].max(), result[1][-2].max())
+        heatmap_feature = stages_output[-2]
+        pafs_feature = stages_output[-1]
+        # print(heatmap_feature.shape)
+        hf_max_indices = heatmap_feature.view(batch_size, self.num_heatmaps, -1).argmax(dim=-1)
+        # print(hf_max_indices.shape)
+        hf_h_coords, hf_w_coords = hf_max_indices // 32, hf_max_indices % 32
+        # print(hf_h_coords.shape, hf_w_coords.shape)
+        coordinates = torch.stack([hf_h_coords, hf_w_coords], dim=-1).float()
+        # print(coordinates.shape)
+        subtracted_coords = coordinates - coordinates[:, 0].unsqueeze(1)
+        # print(subtracted_coords.shape)
+        norms = torch.norm(subtracted_coords, dim=2, keepdim=True)
+        normalized_coords = subtracted_coords / (norms + 1e-10) # (batch_size, key_points, 2(coordinates))
+        # print(normalized_coords.shape)
 
-        # result = torch.cat([result[0], result[1][-2]], dim=1)
-        # result = torch.cat([result[0], result[1][-2]], dim=1)
+        output = self.classifier(normalized_coords.view(batch_size, -1))
+        # print(output.shape)
 
-        # import matplotlib.pylab as plt
-        # print(result[1][-2].max(), result[1][-2].min())
-        # plt.imshow(result[1][-2][0].max(dim=0).values.detach().cpu().numpy())
-        # plt.savefig("test.png")
-        # print(result[1][-2].size())
-
-        output = self.classifier(result[-2])
-
-        return output, result
+        return output, stages_output

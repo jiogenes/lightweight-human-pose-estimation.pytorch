@@ -69,13 +69,19 @@ def infer_fast(net, img, net_input_height_size, stride, upsample_ratio, cpu,
             tensor_img = tensor_img.to('mps')
         # tensor_img = tensor_img.cuda()
 
-    stages_output = net(tensor_img)
+    # print(tensor_img.shape)
+    if isinstance(net, PoseEstimationWithMobileNet):
+        stages_output = net(tensor_img)
+    else:
+        output, stages_output = net(tensor_img)
 
     stage2_heatmaps = stages_output[-2]
+    # print(stage2_heatmaps.shape)
     heatmaps = np.transpose(stage2_heatmaps.squeeze().cpu().data.numpy(), (1, 2, 0))
     heatmaps = cv2.resize(heatmaps, (0, 0), fx=upsample_ratio, fy=upsample_ratio, interpolation=cv2.INTER_CUBIC)
 
     stage2_pafs = stages_output[-1]
+    # print(stage2_pafs.shape)
     pafs = np.transpose(stage2_pafs.squeeze().cpu().data.numpy(), (1, 2, 0))
     pafs = cv2.resize(pafs, (0, 0), fx=upsample_ratio, fy=upsample_ratio, interpolation=cv2.INTER_CUBIC)
 
