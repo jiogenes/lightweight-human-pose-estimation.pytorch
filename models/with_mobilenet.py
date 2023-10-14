@@ -129,6 +129,8 @@ class PoseClassificationWithMobileNet(nn.Module):
         self.num_heatmaps = num_heatmaps
         self.num_pafs = num_pafs
         self.height = height
+        self.output_channels = 32
+        self.hidden_size = 128
 
         self.pretrained = pretrained
         for param in self.pretrained.parameters():
@@ -145,36 +147,36 @@ class PoseClassificationWithMobileNet(nn.Module):
         # )
 
         ######### secend try
-        # self.hm_feature_extractor = nn.Sequential(
-        #     nn.Conv2d((num_heatmaps), 32, 5, 1, 2),
-        #     nn.BatchNorm2d(32),
-        #     nn.ReLU(),
+        self.hm_feature_extractor = nn.Sequential(
+            nn.Conv2d((num_heatmaps), self.output_channels, 5, 1, 2),
+            nn.BatchNorm2d(self.output_channels),
+            nn.ReLU(),
 
-        #     nn.Conv2d(32, 32, 5, 2, 2),
-        #     nn.BatchNorm2d(32),
-        #     nn.ReLU(),
+            nn.Conv2d(self.output_channels, self.output_channels, 5, 2, 2),
+            nn.BatchNorm2d(self.output_channels),
+            nn.ReLU(),
 
-        #     nn.Conv2d(32, 32, 5, 1, 2),
-        #     nn.BatchNorm2d(32),
-        #     nn.ReLU(),
+            nn.Conv2d(self.output_channels, self.output_channels, 5, 1, 2),
+            nn.BatchNorm2d(self.output_channels),
+            nn.ReLU(),
 
-        #     nn.Conv2d(32, 32, 5, 2, 2),
-        #     nn.BatchNorm2d(32),
-        #     nn.ReLU(),
+            nn.Conv2d(self.output_channels, self.output_channels, 5, 2, 2),
+            nn.BatchNorm2d(self.output_channels),
+            nn.ReLU(),
 
-        #     nn.AdaptiveAvgPool2d((1, 1)),
-        #     nn.Flatten(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
 
-        #     nn.Linear(32, 1)
-        # )
+            # nn.Linear(32, 1)
+        )
 
         ######## third try
         self.classifier = nn.Sequential(
-            nn.Linear(self.num_heatmaps * 2, self.num_heatmaps),
+            nn.Linear(self.num_heatmaps * 2 + self.output_channels, self.hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            # nn.Dropout(0.1),
 
-            nn.Linear(self.num_heatmaps, 1)
+            nn.Linear(self.hidden_size, 1)
         )
         
 
@@ -184,22 +186,29 @@ class PoseClassificationWithMobileNet(nn.Module):
         with torch.no_grad():
             stages_output = self.pretrained(x)
         
-        heatmap_feature = stages_output[-2]
+
+        heatmap_feature = stages_output[-2] # (batch_szie, 19, 16, 16)
         pafs_feature = stages_output[-1]
+
+        hm_feature = self.hm_feature_extractor(heatmap_feature) # (batch_size, output_channels(32))
+        # print(hm_feature.shape)
+
         # print(heatmap_feature.shape)
         hf_max_indices = heatmap_feature.view(batch_size, self.num_heatmaps, -1).argmax(dim=-1)
         # print(hf_max_indices.shape)
-        hf_h_coords, hf_w_coords = hf_max_indices // 32, hf_max_indices % 32
+        hf_h_coords, hf_w_coords = hf_max_indices // heatmap_feature.size(-1), hf_max_indices % heatmap_feature.size(-1)
         # print(hf_h_coords.shape, hf_w_coords.shape)
-        coordinates = torch.stack([hf_h_coords, hf_w_coords], dim=-1).float()
+        coordinates = torch.stack([hf_h_coords, hf_w_coords], dim=-1).float() # (batch_size, 19, 2)
         # print(coordinates.shape)
-        subtracted_coords = coordinates - coordinates[:, 0].unsqueeze(1)
+        subtracted_coords = coordinates - coordinates.mean(dim=1, keepdim=True) # coordinates[:, 0].unsqueeze(1)
         # print(subtracted_coords.shape)
         norms = torch.norm(subtracted_coords, dim=2, keepdim=True)
         normalized_coords = subtracted_coords / (norms + 1e-10) # (batch_size, key_points, 2(coordinates))
         # print(normalized_coords.shape)
 
-        output = self.classifier(normalized_coords.view(batch_size, -1))
-        # print(output.shape)
+        classifier_input = torch.concat([hm_feature, normalized_coords.view(batch_size, -1)], dim=1)
+
+        output = self.classifier(classifier_input)
+        output = output.view(batch_size)
 
         return output, stages_output

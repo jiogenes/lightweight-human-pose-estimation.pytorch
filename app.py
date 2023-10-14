@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from pathlib import Path
 from PIL import Image
 
@@ -46,11 +47,12 @@ class TrainThread(QThread):
         train_dataloader = DataLoader(train_dataset, batch_size=self.cpu_count, shuffle=True, num_workers=self.cpu_count)
         test_dataloader = DataLoader(test_dataset, batch_size=self.cpu_count, shuffle=False, num_workers=self.cpu_count)
 
-        optimizer = torch.optim.AdamW(self.net.classifier.parameters(), lr=0.001, betas=(0.5, 0.999))
+        optimizer = torch.optim.AdamW(self.net.classifier.parameters(), lr=0.001, betas=(0.5, 0.999)) # betas=(0.5, 0.999)
         loss_func = torch.nn.BCEWithLogitsLoss()
         
+        start_time = time.time()
         for e in range(self.epochs):
-            self.progress.emit(int((e + 1) * 100 / self.epochs))
+            self.progress.emit(int(e * 100 / self.epochs))
             QThread.msleep(100)  
 
             self.net.train()
@@ -71,12 +73,12 @@ class TrainThread(QThread):
 
                 pred, _ = self.net(images)
                 optimizer.zero_grad()
-                loss = loss_func(pred.squeeze(), labels)
+                loss = loss_func(pred, labels)
                 loss.backward()
                 optimizer.step()
 
                 loss_avg += loss.cpu().detach().item()
-                acc += ((torch.nn.functional.sigmoid(pred.squeeze()) > 0.5) == labels.squeeze()).float().mean().item()
+                acc += ((torch.nn.functional.sigmoid(pred) > 0.5) == labels).float().mean().item()
 
             print('train loss :', loss_avg / (idx+1))
             print('train acc :', acc*100 / (idx+1) )
@@ -98,13 +100,16 @@ class TrainThread(QThread):
 
 
                 pred, _ = self.net(images)
-                loss = loss_func(pred.squeeze(), labels)
+                loss = loss_func(pred, labels)
 
                 loss_avg += loss.cpu().detach().item()
-                acc += ((torch.nn.functional.sigmoid(pred.squeeze()) > 0.5) == labels.squeeze()).float().mean().item()
+                acc += ((torch.nn.functional.sigmoid(pred) > 0.5) == labels).float().mean().item()
 
             print('test loss :', loss_avg / (idx+1))
             print('test acc :', acc*100 / (idx+1))
+
+        end_time = time.time()
+        print(f'total time : {end_time - start_time:.5f} sec')
 
         self.save_motion()
         
@@ -118,16 +123,18 @@ class TrainThread(QThread):
         with open(f'./motions/{self.new_motion_name}.pt', 'wb') as f:
             torch.save({'state_dict': state_dict}, f)
         
-        print('success to save to "./motions/{self.new_motion_name}.pt"')
+        print(f'success to save to "./motions/{self.new_motion_name}.pt"')
 
 class App(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.basic_motion_name = 'standing'
+        self.basic_motion_exist = False
         self.is_new_motion = False
-        self.height_size = 256
+        self.height_size = 128
         self.stride = 8
-        self.upsample_ratio = 8
+        self.upsample_ratio = 4
         self.num_keypoints = Pose.num_kpts
         self.previous_poses = []
 
@@ -246,6 +253,7 @@ class App(QMainWindow):
         ret, img = self.capture.read()
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+        prev_time = time.time()
         if not self.is_new_motion:
             orig_img = img.copy()
             output, heatmaps, pafs, scale, pad = self.infer_fast(img, self.height_size, self.stride, self.upsample_ratio)
@@ -274,13 +282,18 @@ class App(QMainWindow):
             for pose in current_poses:
                 pose.draw(img)
             img = cv2.addWeighted(orig_img, 0.6, img, 0.4, 0)
+
+            cur_time = time.time()
+            fps = 1 / (cur_time - prev_time)
+            prev_time = cur_time
+
             for pose in current_poses:
                 if output >= 0.5:
                     color = (255, 0, 0)
-                    self.status_label.setText(f"Status: prob={int(output * 100)}%, Detected!")
+                    self.status_label.setText(f"Status: prob={int(output * 100)}% Detected!, FPS : {fps:.1f}")
                 else:
                     color = (0, 255, 0)
-                    self.status_label.setText(f"Status: prob={int(output * 100)}%, Not Detected")
+                    self.status_label.setText(f"Status: prob={int(output * 100)}% Not Detected, FPS : {fps:.1f}")
 
                 cv2.rectangle(img, (pose.bbox[0], pose.bbox[1]),
                             (pose.bbox[0] + pose.bbox[2], pose.bbox[1] + pose.bbox[3]), color)
@@ -300,17 +313,33 @@ class App(QMainWindow):
         frame = QImage(img, img.shape[1], img.shape[0], qformat)
         self.video_label.setPixmap(QPixmap.fromImage(frame))
 
-        Path(f'./data/{self.new_motion_name}/').mkdir(parents=True, exist_ok=True)
-
-        image_count = len(list(Path(f'./data/{self.new_motion_name}/').glob('*.jpg')))
-        if image_count <= 200:
-            cv2.imwrite(f'./data/{self.new_motion_name}/frame_{image_count}.jpg', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-            self.status_label.setText(f'Status: Take {image_count} pictures')
+        if not self.basic_motion_exist:
+            Path(f'./data/{self.basic_motion_name}/').mkdir(parents=True, exist_ok=True)
+            image_count = len(list(Path(f'./data/{self.basic_motion_name}/').glob('*.jpg')))
+            if image_count <= 500:
+                cv2.imwrite(f'./data/{self.basic_motion_name}/frame_{image_count}.jpg', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                self.status_label.setText(f'Status: Take {image_count} pictures undetected')
+            else:
+                self.timer.stop()
+                value = self.show_info('Take a picture of your posture to detect. Please take your stance. If you want to cancel this process, you can press the cancel button.')
+                if value == QMessageBox.StandardButton.Ok:
+                    self.basic_motion_exist = True
+                    self.timer.start()
+                    # self.status_label.setText("Status: Select the motions you want to detect or set your own motions")
+                else:
+                    return
         else:
-            self.stop_video()
-            self.is_new_motion = False
-            self.train_thread.set_arguments(self.net, self.new_motion_name, self.transform)
-            self.train_thread.start()
+            Path(f'./data/{self.new_motion_name}/').mkdir(parents=True, exist_ok=True)
+
+            image_count = len(list(Path(f'./data/{self.new_motion_name}/').glob('*.jpg')))
+            if image_count <= 500:
+                cv2.imwrite(f'./data/{self.new_motion_name}/frame_{image_count}.jpg', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                self.status_label.setText(f'Status: Take {image_count} pictures to detect')
+            else:
+                self.stop_video()
+                self.is_new_motion = False
+                self.train_thread.set_arguments(self.net, self.new_motion_name, self.transform)
+                self.train_thread.start()
 
     def load_motion(self):
         options = QFileDialog.Option(QFileDialog.Option.HideNameFilterDetails)
@@ -334,7 +363,7 @@ class App(QMainWindow):
         self.is_new_motion = True
         self.new_motion_name = text
 
-        value = self.show_info('Take a picture of your posture. Please take your stance. If you want to cancel this process, you can press the cancel button.')
+        value = self.show_info('Take a picture of your posture undetected. Please take your stance. If you want to cancel this process, you can press the cancel button.')
         if value != QMessageBox.StandardButton.Ok:
             self.status_label.setText("Status: Select the motions you want to detect or set your own motions")
             return
@@ -349,7 +378,7 @@ class App(QMainWindow):
         self.start_video()
 
     def infer_fast(self, img, net_input_height_size, stride, upsample_ratio,
-               pad_value=(0, 0, 0), img_mean=np.array([128, 128, 128], np.float32), img_scale=np.float32(1/256)):
+               pad_value=(0, 0, 0), img_mean=np.array([128, 128, 128], np.float32), img_scale=np.float32(1/128)):
         height, width, _ = img.shape
         scale = net_input_height_size / height
 
@@ -392,7 +421,8 @@ class CustomDataset(Dataset):
         for path in paths:
             data_list.append(str(path))
             labels.append(1)
-        paths = Path('./data/mpii/mpii_human_pose_v1/images/').glob('*.jpg')
+        # paths = Path('./data/mpii/mpii_human_pose_v1/images/').glob('*.jpg')
+        paths = Path(f'./data/standing/').glob('*.jpg')
         for path in paths:
             data_list.append(str(path))
             labels.append(0)
